@@ -1,0 +1,8 @@
+# 配置文件（含 API 密钥，绝对不能提交）
+config.ini
+
+# 运行时文件
+cookies.txt
+cache.json
+chaoxing.log
+__pycache__/

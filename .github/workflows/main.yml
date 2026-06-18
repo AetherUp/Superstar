@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       username:
-        description: '18588995298'
+        description: '手机号'
         required: false
         default: ''
       password:
-        description: '20071216yyx'
+        description: '密码'
         required: false
         default: ''
       course_list:
-        description: '264391804'
+        description: '课程ID列表'
         required: false
         default: ''
       speed:
