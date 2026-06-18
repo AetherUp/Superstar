@@ -49,7 +49,7 @@ jobs:
 
       - name: 生成配置文件
         run: |
-          cat > config.ini << 'EOF'
+          cat > config.ini << EOF
           [common]
           username = ${USERNAME}
           password = ${PASSWORD}
