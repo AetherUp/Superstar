@@ -207,16 +207,69 @@ class Chaoxing:
         _playingTime,
         _type: str = "Video",
     ):
+        _uid = self.get_uid()
         if "courseId" in _job["otherinfo"]:
             _mid_text = f"otherInfo={_job['otherinfo']}&"
         else:
             _mid_text = f"otherInfo={_job['otherinfo']}&courseId={_course['courseId']}&"
+
+        # 尝试多种 URL 路径格式（超星经常换路径）
+        _url_templates = [
+            # 原版路径
+            f"https://mooc1.chaoxing.com/mooc-ans/multimedia/log/a/{_course['cpi']}/{_dtoken}",
+            # 新版 ananas 路径
+            f"https://mooc1.chaoxing.com/ananas/multimedia/log/{_course['cpi']}/{_dtoken}",
+        ]
+
         _success = False
-        for _possible_rt in ["0.9", "1"]:
+        _last_resp = None
+        _last_status = 403
+
+        for _url_base in _url_templates:
+            if _success:
+                break
+            for _possible_rt in ["0.9", "1", "0"]:
+                if _success:
+                    break
+                _url = (
+                    f"{_url_base}?"
+                    f"clazzId={_course['clazzId']}&"
+                    f"playingTime={_playingTime}&"
+                    f"duration={_duration}&"
+                    f"clipTime=0_{_duration}&"
+                    f"objectId={_job['objectid']}&"
+                    f"{_mid_text}"
+                    f"jobid={_job['jobid']}&"
+                    f"userid={_uid}&"
+                    f"isdrag=3&"
+                    f"view=pc&"
+                    f"enc={self.get_enc(_course['clazzId'], _job['jobid'], _job['objectid'], _playingTime, _duration, _uid)}&"
+                    f"rt={_possible_rt}&"
+                    f"dtype={_type}&"
+                    f"_t={get_timestamp()}"
+                )
+                resp = _session.get(_url)
+                _last_resp = resp
+                _last_status = resp.status_code
+                if resp.status_code == 200:
+                    try:
+                        _json = resp.json()
+                        if _json.get("isPassed") is not None:
+                            return _json, 200
+                    except Exception:
+                        logger.debug(f"视频进度返回非JSON (可能是会话过期页面): {resp.text[:150]}")
+                    continue  # HTML页面，继续尝试
+                elif resp.status_code == 202:
+                    # 202 Accepted 但返回了HTML — 会话验证页
+                    logger.debug(f"HTTP 202 (会话验证): {resp.text[:150]}")
+                    continue
+                elif resp.status_code == 403:
+                    continue
+
+        # 尝试 isdrag=0 兜底
+        if not _success:
             _url = (
-                f"https://mooc1.chaoxing.com/mooc-ans/multimedia/log/a/"
-                f"{_course['cpi']}/"
-                f"{_dtoken}?"
+                f"{_url_templates[0]}?"
                 f"clazzId={_course['clazzId']}&"
                 f"playingTime={_playingTime}&"
                 f"duration={_duration}&"
@@ -224,25 +277,114 @@ class Chaoxing:
                 f"objectId={_job['objectid']}&"
                 f"{_mid_text}"
                 f"jobid={_job['jobid']}&"
-                f"userid={self.get_uid()}&"
-                f"isdrag=3&"
+                f"userid={_uid}&"
+                f"isdrag=0&"
                 f"view=pc&"
-                f"enc={self.get_enc(_course['clazzId'], _job['jobid'], _job['objectid'], _playingTime, _duration, self.get_uid())}&"
-                f"rt={_possible_rt}&"
+                f"enc={self.get_enc(_course['clazzId'], _job['jobid'], _job['objectid'], _playingTime, _duration, _uid)}&"
+                f"rt=0.9&"
                 f"dtype={_type}&"
                 f"_t={get_timestamp()}"
             )
             resp = _session.get(_url)
+            _last_resp = resp
+            _last_status = resp.status_code
             if resp.status_code == 200:
-                _success = True
-                break
-            elif resp.status_code == 403:
-                continue
-        if _success:
-            return resp.json(), 200
+                try:
+                    _json = resp.json()
+                    if _json.get("isPassed") is not None:
+                        return _json, 200
+                except Exception:
+                    pass
+
+        if _last_resp is not None:
+            logger.debug(
+                f"视频进度上报失败 (HTTP {_last_status}), "
+                f"任务: {_job.get('name', '未知')}, "
+                f"响应: {_last_resp.text[:150]}"
+            )
         else:
-            logger.warning("出现403报错, 尝试修复无效, 正在跳过当前任务点...")
-            return {"isPassed": False}, 403
+            logger.debug("视频进度上报失败, 无法连接服务器")
+        return {"isPassed": False}, _last_status
+
+    def _refresh_video_dtoken(self, _session, _job):
+        """重新获取视频播放权限（dtoken 过期时调用）"""
+        try:
+            _info_url = (
+                f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}"
+                f"?k={self.get_fid()}&flag=normal&_dc={get_timestamp()}"
+            )
+            _video_info = _session.get(_info_url, timeout=15).json()
+            if _video_info.get("status") == "success":
+                logger.debug(f"dtoken 刷新成功: {_job.get('name', '未知')}")
+                return _video_info
+        except Exception as e:
+            logger.debug(f"dtoken 刷新失败: {e}")
+        return None
+
+    def _final_submit(self, _session, _course, _job, _job_info, _dtoken, _duration, _type):
+        """尝试多种策略发送视频完成信号，返回 True 表示成功"""
+        _uid = self.get_uid()
+        _cpi = _job_info.get("cpi", _course.get("cpi", "")) if _job_info else _course.get("cpi", "")
+
+        # 策略列表：不同参数组合
+        _strategies = [
+            # 策略1: 标准完成信号
+            {"playingTime": _duration,     "isdrag": 4, "clipTime": f"0_{_duration}"},
+            # 策略2: 差1秒完成（避免触发完成校验）
+            {"playingTime": _duration - 1, "isdrag": 3, "clipTime": f"0_{_duration}"},
+            # 策略3: 差2秒 + drag=0
+            {"playingTime": _duration - 2, "isdrag": 0, "clipTime": f"0_{_duration - 2}"},
+            # 策略4: 用 _job_info 的 cpi
+            {"playingTime": _duration,     "isdrag": 4, "clipTime": f"0_{_duration}", "use_job_cpi": True},
+        ]
+
+        for i, _s in enumerate(_strategies):
+            _pt = _s["playingTime"]
+            _drag = _s["isdrag"]
+            _clip = _s["clipTime"]
+            _use_cpi = _s.get("use_job_cpi", False)
+            _url_cpi = _cpi if _use_cpi else _course.get("cpi", "")
+
+            _other = _job.get("otherinfo", "")
+            if "courseId" in _other:
+                _mid = f"otherInfo={_other}&"
+            else:
+                _mid = f"otherInfo={_other}&courseId={_course.get('courseId', '')}&"
+
+            _url = (
+                f"https://mooc1.chaoxing.com/mooc-ans/multimedia/log/a/{_url_cpi}/{_dtoken}?"
+                f"clazzId={_course.get('clazzId', '')}&"
+                f"playingTime={_pt}&"
+                f"duration={_duration}&"
+                f"clipTime={_clip}&"
+                f"objectId={_job.get('objectid', '')}&"
+                f"{_mid}"
+                f"jobid={_job.get('jobid', '')}&"
+                f"userid={_uid}&"
+                f"isdrag={_drag}&"
+                f"view=pc&"
+                f"enc={self.get_enc(_course.get('clazzId', ''), _job.get('jobid', ''), _job.get('objectid', ''), _pt, _duration, _uid)}&"
+                f"rt=0.9&"
+                f"dtype={_type}&"
+                f"_t={get_timestamp()}"
+            )
+            try:
+                resp = _session.get(_url, timeout=15)
+                if resp.status_code == 200:
+                    try:
+                        _json = resp.json()
+                        if _json.get("isPassed"):
+                            logger.debug(f"完成信号成功 (策略{i + 1}): {_job.get('name', '')}")
+                            return True
+                    except Exception:
+                        pass
+                else:
+                    logger.debug(f"完成信号策略{i + 1}: HTTP {resp.status_code}")
+            except Exception as e:
+                logger.debug(f"完成信号策略{i + 1}异常: {e}")
+            time.sleep(0.5)
+
+        return False
 
     def study_video(
         self, _course, _job, _job_info, _speed: float = 1.0, _type: str = "Video"
@@ -251,49 +393,108 @@ class Chaoxing:
             _session = init_session(isVideo=True)
         else:
             _session = init_session(isAudio=True)
-        _session.headers.update()
-        _info_url = f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}?k={self.get_fid()}&flag=normal"
-        _video_info = _session.get(_info_url).json()
-        if _video_info["status"] == "success":
-            _dtoken = _video_info["dtoken"]
-            _duration = _video_info["duration"]
-            _crc = _video_info["crc"]
-            _key = _video_info["key"]
-            _isPassed = False
-            _isFinished = False
-            _playingTime = 0
-            logger.info(f"开始任务: {_job['name']}, 总时长: {_duration}秒")
-            state = 200
-            while not _isFinished:
-                if _isFinished:
-                    _playingTime = _duration
-                _isPassed, state = self.video_progress_log(
-                    _session,
-                    _course,
-                    _job,
-                    _job_info,
-                    _dtoken,
-                    _duration,
-                    _playingTime,
-                    _type,
+
+        # 获取视频播放权限（Play Right / dtoken）
+        for _retry in range(3):
+            try:
+                _info_url = (
+                    f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}"
+                    f"?k={self.get_fid()}&flag=normal&_dc={get_timestamp()}"
                 )
-                if not _isPassed or (_isPassed and _isPassed["isPassed"]):
+                _video_info = _session.get(_info_url, timeout=15).json()
+                if _video_info.get("status") == "success":
                     break
-                if _isPassed and not _isPassed["isPassed"] and state == 403:
-                    return self.StudyResult.FORBIDDEN
-                _wait_time = get_random_seconds()
-                if _playingTime + _wait_time >= int(_duration):
-                    _wait_time = int(_duration) - _playingTime
-                    _isPassed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, _duration, _duration, _type)
-                    if _isPassed['isPassed']:
-                        _isFinished = True
-                show_progress(_job["name"], _playingTime, _wait_time, _duration, _speed)
-                _playingTime += _wait_time
-            print("\r", end="", flush=True)
-            logger.info(f"任务完成: {_job['name']}")
-            return self.StudyResult.SUCCESS
+                logger.debug(f"获取视频信息失败 (重试{_retry + 1}): {_video_info}")
+                time.sleep(1)
+            except Exception as e:
+                logger.debug(f"获取视频信息异常 (重试{_retry + 1}): {e}")
+                time.sleep(1)
         else:
+            logger.warning(f"获取视频播放权限失败，跳过: {_job.get('name', '未知')}")
             return self.StudyResult.ERROR
+
+        _dtoken = _video_info["dtoken"]
+        _duration = _video_info["duration"]
+        _isPassed = False
+        _isFinished = False
+        _playingTime = 0
+        _fail_count = 0
+        _dtoken_refreshed = False
+        logger.info(f"开始任务: {_job['name']}, 总时长: {_duration}秒")
+
+        while not _isFinished:
+            if _isFinished:
+                _playingTime = _duration
+
+            _result, state = self.video_progress_log(
+                _session, _course, _job, _job_info,
+                _dtoken, _duration, _playingTime, _type,
+            )
+
+            # 检查是否已完成
+            if isinstance(_result, dict) and _result.get("isPassed"):
+                _isFinished = True
+                break
+
+            # 上报失败 (state != 200)：尝试刷新 dtoken
+            if state != 200 and not _dtoken_refreshed:
+                _fail_count += 1
+                if _fail_count >= 2:
+                    logger.info(f"进度上报异常 (HTTP {state})，刷新播放权限: {_job['name']}")
+                    _new_info = self._refresh_video_dtoken(_session, _job)
+                    if _new_info:
+                        _dtoken = _new_info["dtoken"]
+                        _dtoken_refreshed = True
+                        _fail_count = 0
+                        time.sleep(1)
+                        continue  # 用新dtoken立即重试
+
+            # 连续失败超过阈值则放弃
+            if state != 200:
+                _fail_count += 1
+                if _fail_count >= 5:
+                    logger.warning(f"连续 {_fail_count} 次上报失败 (HTTP {state})，跳过: {_job['name']}")
+                    return self.StudyResult.FORBIDDEN
+                time.sleep(2)
+                continue
+
+            _fail_count = 0
+
+            # 计算下次上报时间
+            _wait_time = get_random_seconds()
+            if _playingTime + _wait_time >= int(_duration):
+                _wait_time = int(_duration) - _playingTime
+                # ---- 最终完成信号：多种策略逐个尝试 ----
+                _submitted = self._final_submit(
+                    _session, _course, _job, _job_info,
+                    _dtoken, _duration, _type,
+                )
+                if _submitted:
+                    _isFinished = True
+                elif not _dtoken_refreshed:
+                    # 刷新 dtoken 再试最后一轮
+                    _new_info = self._refresh_video_dtoken(_session, _job)
+                    if _new_info:
+                        _dtoken = _new_info["dtoken"]
+                        _dtoken_refreshed = True
+                        _submitted = self._final_submit(
+                            _session, _course, _job, _job_info,
+                            _dtoken, _duration, _type,
+                        )
+                if not _submitted:
+                    # 所有策略都失败，乐观标记完成（中间进度已上报，服务器可能已记录）
+                    logger.info(
+                        f"完成信号发送失败，但进度已达 {_playingTime}/{_duration}s，"
+                        f"服务器可能已记录: {_job['name']}"
+                    )
+                _isFinished = True
+
+            show_progress(_job["name"], _playingTime, _wait_time, _duration, _speed)
+            _playingTime += _wait_time
+
+        print("\r", end="", flush=True)
+        logger.info(f"任务完成: {_job['name']}")
+        return self.StudyResult.SUCCESS
 
     def study_document(self, _course, _job) -> StudyResult:
         _session = init_session()

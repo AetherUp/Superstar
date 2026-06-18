@@ -11,6 +11,7 @@ from urllib3 import disable_warnings, exceptions
 # 修复导入路径：原DoubaoTiku替换为Tiku基类+Doubao实现
 from api.logger import logger
 from api.base import Chaoxing, Account
+from api.config import GlobalConst
 from api.exceptions import LoginError, InputFormatError, MaxRollBackExceeded
 from api.answer import Tiku  # 导入Tiku基类
 from api.notification import Notification
@@ -27,7 +28,7 @@ def parse_args():
     )
 
     parser.add_argument(
-        "-c", "--config", type=str, default=None, help="使用配置文件运行程序"
+        "-c", "--config", type=str, default="config.ini", help="使用配置文件运行程序（默认 config.ini）"
     )
     parser.add_argument("-u", "--username", type=str, default=None, help="手机号账号")
     parser.add_argument("-p", "--password", type=str, default=None, help="登录密码")
@@ -70,6 +71,9 @@ def load_config_from_file(config_path):
     # 检查并读取common节
     if config.has_section("common"):
         common_config = dict(config.items("common"))
+        # 处理cookies_path（多账号隔离）—— 必须在其他模块使用前设置
+        if "cookies_path" in common_config and common_config["cookies_path"]:
+            GlobalConst.set_cookies_path(common_config["cookies_path"])
         # 处理course_list，将字符串转换为列表
         if "course_list" in common_config and common_config["course_list"]:
             common_config["course_list"] = common_config["course_list"].split(",")
@@ -346,31 +350,65 @@ def process_course(chaoxing, course, notopen_action, speed):
 
 
 def filter_courses(all_course, course_list):
-    """过滤要学习的课程"""
-    if not course_list:
-        # 手动输入要学习的课程ID列表
-        print("*" * 10 + "课程列表" + "*" * 10)
-        for course in all_course:
-            print(f"ID: {course['courseId']} 课程名: {course['title']}")
-        print("*" * 28)
+    """过滤要学习的课程（交互式编号选择）"""
+    if not all_course:
+        logger.warning("未获取到任何课程")
+        return []
+
+    # 打印编号课程列表
+    print("\n" + "=" * 50)
+    print("课程列表".center(46))
+    print("=" * 50)
+    for i, course in enumerate(all_course, 1):
+        print(f"  [{i}] {course['title']}")
+        print(f"      课程ID: {course['courseId']}  教师: {course.get('teacher', '未知')}")
+    print("=" * 50)
+
+    # 如果配置文件中已预置课程列表，直接筛选
+    if course_list:
+        course_task = [c for c in all_course if c["courseId"] in course_list]
+        if course_task:
+            logger.info(f"使用配置文件中的课程列表，共 {len(course_task)} 门")
+            return course_task
+
+    # 预建课程ID到索引的映射
+    _id_to_idx = {c["courseId"]: i + 1 for i, c in enumerate(all_course)}
+
+    # 交互式选择
+    while True:
         try:
-            course_list = input(
-                "请输入想要学习的课程列表,以逗号分隔,例: 2151141,189191,198198\n"
-            ).split(",")
+            choice = input("\n请输入课程编号或ID（如 2 或 264391804，多个用逗号分隔，回车=全部）: ").strip()
+            if choice == "":
+                logger.info(f"已选择全部 {len(all_course)} 门课程")
+                return all_course
+
+            course_task = []
+            for raw in choice.split(","):
+                raw = raw.strip()
+                if not raw:
+                    continue
+
+                # 先尝试作为编号
+                try:
+                    idx = int(raw)
+                    if 1 <= idx <= len(all_course):
+                        course_task.append(all_course[idx - 1])
+                        continue
+                except ValueError:
+                    pass
+
+                # 再尝试作为课程ID匹配
+                if raw in _id_to_idx:
+                    course_task.append(all_course[_id_to_idx[raw] - 1])
+                else:
+                    print(f"  [!] \"{raw}\" 不是有效编号也不是有效课程ID，已跳过")
+
+            if course_task:
+                logger.info(f"已选择 {len(course_task)} 门课程")
+                return course_task
+            print("  [!] 未选中任何有效课程，请重新输入")
         except Exception as e:
             raise InputFormatError("输入格式错误") from e
-
-    # 筛选需要学习的课程
-    course_task = []
-    for course in all_course:
-        if course["courseId"] in course_list:
-            course_task.append(course)
-    
-    # 如果没有指定课程，则学习所有课程
-    if not course_task:
-        course_task = all_course
-    
-    return course_task
 
 
 def main():
